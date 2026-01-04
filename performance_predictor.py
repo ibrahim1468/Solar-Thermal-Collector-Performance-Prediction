@@ -4,6 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+from scipy.integrate import trapezoid
 import joblib
 from datetime import datetime, timedelta
 import warnings
@@ -559,64 +560,135 @@ def main():
         
         st.info("Simulating collector performance over 24 hours with current conditions")
         
-        # Generate daily profile
-        hours, predictions, efficiencies = create_hourly_profile(inputs)
+        # Get day of year from advanced options
+        with st.expander("📅 Simulation Settings", expanded=False):
+            sim_day = st.slider("Day of Year for Simulation", 1, 365, day_of_year, 
+                               help="Select the day for daily profile simulation")
+            show_irradiance = st.checkbox("Show Irradiance Profile", value=True)
+            show_elevation = st.checkbox("Show Solar Elevation", value=True)
+        
+        # Generate daily profile with proper temporal features
+        hours, predictions, efficiencies, irradiances, solar_elevations = create_hourly_profile(
+            inputs, day_of_year=sim_day
+        )
         
         # Create subplots
+        n_plots = 2 + (1 if show_irradiance else 0) + (1 if show_elevation else 0)
+        subplot_titles = ['Thermal Power Output', 'Thermal Efficiency']
+        if show_irradiance:
+            subplot_titles.append('Solar Irradiance')
+        if show_elevation:
+            subplot_titles.append('Solar Elevation')
+        
         fig = make_subplots(
-            rows=2, cols=1,
-            subplot_titles=('Thermal Power Output', 'Thermal Efficiency'),
-            vertical_spacing=0.15
+            rows=n_plots, cols=1,
+            subplot_titles=subplot_titles,
+            vertical_spacing=0.12
         )
+        
+        row_idx = 1
         
         # Power plot
         fig.add_trace(
             go.Scatter(x=hours, y=predictions, mode='lines+markers',
                       name='Power', line=dict(color='#1f77b4', width=3),
-                      fill='tozeroy'),
-            row=1, col=1
+                      fill='tozeroy', fillcolor='rgba(31, 119, 180, 0.3)'),
+            row=row_idx, col=1
         )
+        fig.update_yaxes(title_text="Power (W/m²)", row=row_idx, col=1)
+        row_idx += 1
         
         # Efficiency plot
         fig.add_trace(
             go.Scatter(x=hours, y=efficiencies, mode='lines+markers',
                       name='Efficiency', line=dict(color='#2ca02c', width=3),
-                      fill='tozeroy'),
-            row=2, col=1
+                      fill='tozeroy', fillcolor='rgba(44, 160, 44, 0.3)'),
+            row=row_idx, col=1
         )
+        fig.update_yaxes(title_text="Efficiency (%)", row=row_idx, col=1)
+        row_idx += 1
         
-        fig.update_xaxes(title_text="Hour of Day", row=2, col=1)
-        fig.update_yaxes(title_text="Power (W/m²)", row=1, col=1)
-        fig.update_yaxes(title_text="Efficiency (%)", row=2, col=1)
+        # Irradiance plot (optional)
+        if show_irradiance:
+            fig.add_trace(
+                go.Scatter(x=hours, y=irradiances, mode='lines',
+                          name='Irradiance', line=dict(color='#ff7f0e', width=3),
+                          fill='tozeroy', fillcolor='rgba(255, 127, 14, 0.3)'),
+                row=row_idx, col=1
+            )
+            fig.update_yaxes(title_text="Irradiance (W/m²)", row=row_idx, col=1)
+            row_idx += 1
         
-        fig.update_layout(height=700, showlegend=False)
+        # Solar elevation plot (optional)
+        if show_elevation:
+            fig.add_trace(
+                go.Scatter(x=hours, y=solar_elevations, mode='lines',
+                          name='Solar Elevation', line=dict(color='#d62728', width=3)),
+                row=row_idx, col=1
+            )
+            fig.update_yaxes(title_text="Elevation (°)", row=row_idx, col=1)
+        
+        fig.update_xaxes(title_text="Hour of Day", row=n_plots, col=1)
+        fig.update_layout(height=300 * n_plots, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
         
         # Daily statistics
         col1, col2, col3, col4 = st.columns(4)
+        
+        # Use scipy.integrate.trapezoid instead of deprecated np.trapz
+        from scipy.integrate import trapezoid
+        daily_energy = trapezoid(predictions, hours) / 1000  # Convert to kWh/m²
         
         with col1:
             st.metric("Peak Power", f"{max(predictions):.1f} W/m²")
         with col2:
             st.metric("Average Power", f"{np.mean(predictions):.1f} W/m²")
         with col3:
-            st.metric("Daily Energy", f"{np.trapz(predictions) / 1000:.2f} kWh/m²")
+            st.metric("Daily Energy", f"{daily_energy:.2f} kWh/m²")
         with col4:
+            active_hours = sum(1 for p in predictions if p > 10)
+            st.metric("Active Hours", f"{active_hours} hrs")
+        
+        # Additional daily statistics
+        st.markdown("---")
+        st.subheader("📊 Daily Performance Summary")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
             st.metric("Avg Efficiency", f"{np.mean(efficiencies):.1f}%")
+            st.metric("Peak Efficiency", f"{max(efficiencies):.1f}%")
+        
+        with col2:
+            operational_predictions = [p for p in predictions if p > 10]
+            if operational_predictions:
+                st.metric("Avg Operating Power", f"{np.mean(operational_predictions):.1f} W/m²")
+            else:
+                st.metric("Avg Operating Power", "N/A")
+            st.metric("Peak Irradiance", f"{max(irradiances):.1f} W/m²")
+        
+        with col3:
+            sunrise_hour = next((h for h, se in enumerate(solar_elevations) if se > 0), 0)
+            sunset_hour = next((h for h in range(23, -1, -1) if solar_elevations[h] > 0), 23)
+            st.metric("Sunrise Hour", f"~{sunrise_hour}:00")
+            st.metric("Sunset Hour", f"~{sunset_hour}:00")
         
         # Download option
         df_profile = pd.DataFrame({
             'Hour': hours,
             'Power (W/m²)': predictions,
-            'Efficiency (%)': efficiencies
+            'Efficiency (%)': efficiencies,
+            'Irradiance (W/m²)': irradiances,
+            'Solar Elevation (°)': solar_elevations
         })
         
         csv = df_profile.to_csv(index=False)
         st.download_button(
-            label="📥 Download Daily Profile",
+            label="📥 Download Daily Profile CSV",
             data=csv,
-            file_name="daily_profile.csv",
-            mime="text/csv"
+            file_name=f"daily_profile_day{sim_day}.csv",
+            mime="text/csv",
+            help="Download the complete daily profile data"
         )
     
     # ========================================================================
@@ -625,35 +697,53 @@ def main():
     elif mode == "Sensitivity Analysis":
         st.header("🔍 Sensitivity Analysis")
         
+        st.info("Analyze how thermal power varies with a single parameter while keeping others constant")
+        
         param_choice = st.selectbox(
             "Select Parameter to Vary",
-            ["G_poa", "mass_flow", "T_inlet", "wind_speed", "solar_elevation"]
+            ["G_poa", "mass_flow", "T_inlet", "wind_speed", "solar_elevation", "T_ambient"],
+            help="Choose which parameter to sweep through its range"
         )
+        
+        # Number of points for sweep
+        n_points = st.slider("Number of Points", 20, 100, 50, 
+                            help="More points = smoother curve but slower calculation")
         
         # Get parameter range
         param_min = CONSTRAINTS[param_choice]['min']
         param_max = CONSTRAINTS[param_choice]['max']
-        param_values = np.linspace(param_min, param_max, 50)
+        param_values = np.linspace(param_min, param_max, n_points)
         
         predictions = []
         efficiencies = []
+        delta_temps = []
         
         # Calculate predictions for each value
-        progress_bar = st.progress(0)
+        progress_bar = st.progress(0, text="Running sensitivity analysis...")
         for i, val in enumerate(param_values):
             inputs_copy = inputs.copy()
             inputs_copy[param_choice] = val
             
             pred = make_prediction(inputs_copy)
-            predictions.append(max(0, pred))
+            pred = max(0, pred)
+            predictions.append(pred)
             
+            # Calculate efficiency
             if inputs_copy['G_poa'] > 10:
                 eff = (pred / inputs_copy['G_poa']) * 100
                 efficiencies.append(max(0, min(100, eff)))
             else:
                 efficiencies.append(0)
             
-            progress_bar.progress((i + 1) / len(param_values))
+            # Calculate delta T
+            if inputs_copy['mass_flow'] > 0.01:
+                dt = pred / (inputs_copy['mass_flow'] * C_P_WATER)
+                delta_temps.append(dt)
+            else:
+                delta_temps.append(0)
+            
+            progress_bar.progress((i + 1) / len(param_values), 
+                                 text=f"Analyzing point {i+1}/{n_points}...")
         
         progress_bar.empty()
         
@@ -665,41 +755,140 @@ def main():
             param_values_display = param_values
             x_label = f"{param_choice} ({CONSTRAINTS[param_choice]['unit']})"
         
-        # Create plots
+        # Create comprehensive plots
         fig = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=('Power vs Parameter', 'Efficiency vs Parameter')
+            rows=2, cols=2,
+            subplot_titles=(
+                'Power vs Parameter', 
+                'Efficiency vs Parameter',
+                'Temperature Rise vs Parameter',
+                'Power Gradient'
+            ),
+            vertical_spacing=0.15,
+            horizontal_spacing=0.12
         )
         
+        # 1. Power vs Parameter
         fig.add_trace(
             go.Scatter(x=param_values_display, y=predictions, mode='lines',
-                      line=dict(color='#1f77b4', width=3)),
+                      line=dict(color='#1f77b4', width=3),
+                      fill='tozeroy', fillcolor='rgba(31, 119, 180, 0.3)'),
             row=1, col=1
         )
         
+        # 2. Efficiency vs Parameter
         fig.add_trace(
             go.Scatter(x=param_values_display, y=efficiencies, mode='lines',
-                      line=dict(color='#2ca02c', width=3)),
+                      line=dict(color='#2ca02c', width=3),
+                      fill='tozeroy', fillcolor='rgba(44, 160, 44, 0.3)'),
             row=1, col=2
+        )
+        
+        # 3. Delta T vs Parameter
+        fig.add_trace(
+            go.Scatter(x=param_values_display, y=delta_temps, mode='lines',
+                      line=dict(color='#ff7f0e', width=3),
+                      fill='tozeroy', fillcolor='rgba(255, 127, 14, 0.3)'),
+            row=2, col=1
+        )
+        
+        # 4. Power gradient (derivative)
+        gradients = np.gradient(predictions, param_values)
+        fig.add_trace(
+            go.Scatter(x=param_values_display, y=gradients, mode='lines',
+                      line=dict(color='#d62728', width=3)),
+            row=2, col=2
         )
         
         fig.update_xaxes(title_text=x_label, row=1, col=1)
         fig.update_xaxes(title_text=x_label, row=1, col=2)
+        fig.update_xaxes(title_text=x_label, row=2, col=1)
+        fig.update_xaxes(title_text=x_label, row=2, col=2)
+        
         fig.update_yaxes(title_text="Power (W/m²)", row=1, col=1)
         fig.update_yaxes(title_text="Efficiency (%)", row=1, col=2)
+        fig.update_yaxes(title_text="ΔT (K)", row=2, col=1)
+        fig.update_yaxes(title_text="dP/dParam", row=2, col=2)
         
-        fig.update_layout(height=500, showlegend=False)
+        fig.update_layout(height=700, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
         
         # Statistics
-        col1, col2, col3 = st.columns(3)
+        st.markdown("---")
+        st.subheader("📊 Sensitivity Statistics")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
         with col1:
             st.metric("Max Power", f"{max(predictions):.1f} W/m²")
-        with col2:
             st.metric("Min Power", f"{min(predictions):.1f} W/m²")
+        
+        with col2:
+            power_range = max(predictions) - min(predictions)
+            st.metric("Power Range", f"{power_range:.1f} W/m²")
+            st.metric("Relative Range", f"{(power_range/max(predictions)*100):.1f}%")
+        
         with col3:
-            sensitivity = (max(predictions) - min(predictions)) / (param_max - param_min)
-            st.metric("Sensitivity", f"{sensitivity:.2f} W/m² per unit")
+            avg_sensitivity = power_range / (param_max - param_min)
+            st.metric("Avg Sensitivity", f"{avg_sensitivity:.2f} W/m² per unit")
+            max_gradient = max(abs(g) for g in gradients)
+            st.metric("Max Gradient", f"{max_gradient:.2f}")
+        
+        with col4:
+            st.metric("Max Efficiency", f"{max(efficiencies):.1f}%")
+            st.metric("Min Efficiency", f"{min(efficiencies):.1f}%")
+        
+        # Interpretation
+        st.markdown("---")
+        st.subheader("💡 Interpretation")
+        
+        # Provide context-specific interpretation
+        if param_choice == "G_poa":
+            st.info("""
+            **Irradiance Sensitivity**: Shows how thermal power increases with solar radiation.
+            - Linear relationship indicates good proportionality
+            - Efficiency changes show collector performance at different light levels
+            - Gradient shows marginal power gain per W/m² of additional irradiance
+            """)
+        elif param_choice == "mass_flow":
+            st.info("""
+            **Flow Rate Sensitivity**: Higher flow typically increases total power but decreases ΔT.
+            - Optimal flow balances total energy vs. temperature rise
+            - Low flow may cause stagnation; high flow increases pumping costs
+            - Gradient shows diminishing returns at high flow rates
+            """)
+        elif param_choice == "T_inlet":
+            st.info("""
+            **Inlet Temperature Sensitivity**: Shows impact of operating temperature on efficiency.
+            - Higher inlet temp increases heat losses (lower efficiency)
+            - Negative gradient indicates performance degradation
+            - Important for system integration and storage design
+            """)
+        elif param_choice == "wind_speed":
+            st.info("""
+            **Wind Speed Sensitivity**: Wind increases convective heat loss from collector.
+            - Negative correlation shows heat loss impact
+            - Well-designed collectors minimize wind sensitivity
+            - Important for exposed installations
+            """)
+        
+        # Download sensitivity data
+        df_sensitivity = pd.DataFrame({
+            param_choice: param_values_display,
+            'Power (W/m²)': predictions,
+            'Efficiency (%)': efficiencies,
+            'Delta_T (K)': delta_temps,
+            'Gradient': gradients
+        })
+        
+        csv = df_sensitivity.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Sensitivity Data",
+            data=csv,
+            file_name=f"sensitivity_{param_choice}.csv",
+            mime="text/csv",
+            help="Download the sensitivity analysis results"
+        )
     
     # ========================================================================
     # FOOTER
