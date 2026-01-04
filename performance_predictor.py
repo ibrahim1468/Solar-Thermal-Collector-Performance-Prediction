@@ -1,219 +1,677 @@
 import streamlit as st
-import joblib
-import numpy as np
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime, time
+import plotly.express as px
+from plotly.subplots import make_subplots
+import joblib
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
 
-# ----------------------------- Page Config -----------------------------
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
 st.set_page_config(
-    page_title="Solar Thermal Collector Performance Predictor",
+    page_title="Solar Thermal Collector Performance Dashboard",
     page_icon="☀️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ----------------------------- Load Model & Artifacts (FIXED) -----------------------------
+# Custom CSS for professional styling
+st.markdown("""
+    <style>
+    .main {
+        padding: 0rem 1rem;
+    }
+    .stAlert {
+        padding: 0.5rem;
+        margin: 0.5rem 0;
+    }
+    div[data-testid="metric-container"] {
+        background-color: #f0f2f6;
+        border: 1px solid #d0d0d0;
+        padding: 10px;
+        border-radius: 5px;
+    }
+    .css-1d391kg {
+        padding-top: 2rem;
+    }
+    h1 {
+        color: #1f77b4;
+        padding-bottom: 1rem;
+    }
+    h2 {
+        color: #2ca02c;
+        padding-top: 1rem;
+    }
+    h3 {
+        color: #ff7f0e;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ============================================================================
+# LOAD MODELS AND CONFIGURATIONS
+# ============================================================================
 @st.cache_resource
-def load_artifacts():
+def load_models():
+    """Load the trained model, scaler, and feature configuration"""
     try:
-        model = joblib.load("best_model_lightgbm_noleak.joblib")
-        scaler = joblib.load("scaler_noleak.joblib")
-        config = joblib.load("feature_config_noleak.joblib")
-        
-        # --- CRITICAL FIX: Robustly extract feature names as list ---
-        if isinstance(config, list):
-            feature_names = config
-        elif isinstance(config, dict):
-            # Try common keys
-            if 'feature_names' in config:
-                feature_names = config['feature_names']
-            elif 'features' in config:
-                feature_names = config['features']
-            else:
-                feature_names = list(config.keys())
-        elif hasattr(config, '__dict__'):
-            feature_names = list(config.__dict__.keys())
-        else:
-            # Fallback: assume it's model-related and extract from model if possible
-            if hasattr(model, 'feature_name_'):
-                feature_names = model.feature_name_()
-            elif hasattr(model, 'feature_names'):
-                feature_names = model.feature_names
-            else:
-                raise ValueError("Could not extract feature names from config or model.")
-        
-        # Final cleanup: ensure list of strings
-        feature_names = [str(name).strip() for name in feature_names]
-        
-        st.success(f"Model and artifacts loaded successfully! Using {len(feature_names)} features.")
-        return model, scaler, feature_names
-    
+        model = joblib.load('best_model_lightgbm_noleak.joblib')
+        scaler = joblib.load('scaler_noleak.joblib')
+        feature_config = joblib.load('feature_config_noleak.joblib')
+        return model, scaler, feature_config
     except Exception as e:
-        st.error(f"Failed to load model artifacts: {str(e)}")
+        st.error(f"Error loading models: {e}")
         st.stop()
 
-model, scaler, feature_names = load_artifacts()
+model, scaler, feature_config = load_models()
 
-# Hardcoded fallback (safety net) - replace with your actual 14 features if needed
-EXPECTED_FEATURES = [
-    "mass_flow", "T_inlet", "G_poa", "G_poa_beam", "G_poa_diffuse",
-    "T_ambient", "wind_speed", "solar_elevation", "shadowed",
-    "hour_sin", "hour_cos", "day_sin", "day_cos", "is_day"
-]
-
-if len(feature_names) != len(EXPECTED_FEATURES):
-    st.warning(f"Feature count mismatch. Expected {len(EXPECTED_FEATURES)}, got {len(feature_names)}. Using loaded ones.")
-
-# ----------------------------- Collector Area -----------------------------
-COLLECTOR_AREA = 516  # m² (gross)
-
-# ----------------------------- Helper Functions -----------------------------
-def celsius_to_kelvin(c):
-    return c + 273.15
-
-def compute_cyclic(time_obj, date_obj):
-    hour = time_obj.hour + time_obj.minute / 60.0
-    day_of_year = date_obj.timetuple().tm_yday
-    hour_sin = np.sin(2 * np.pi * hour / 24)
-    hour_cos = np.cos(2 * np.pi * hour / 24)
-    day_sin = np.sin(2 * np.pi * day_of_year / 365.25)
-    day_cos = np.cos(2 * np.pi * day_of_year / 365.25)
-    return hour_sin, hour_cos, day_sin, day_cos
-
-def is_daytime(elevation, gpoa):
-    return (elevation > 10) and (gpoa > 50)
-
-def predict_specific_power(input_df):
-    try:
-        # Ensure exact column order and selection
-        input_ordered = input_df[feature_names]
-        scaled = scaler.transform(input_ordered)
-        pred = model.predict(scaled)
-        return np.clip(pred, -60, 850)
-    except Exception as e:
-        st.error(f"Prediction failed: {str(e)}")
-        return np.array([0.0])
-
-# ----------------------------- Sidebar Inputs -----------------------------
-st.sidebar.header("☀️ Input Parameters")
-
-col1, col2 = st.sidebar.columns(2)
-
-with col1:
-    st.subheader("Date & Time")
-    input_date = st.date_input("Date", value=datetime(2017, 7, 1))
-    input_time = st.time_input("Time", value=time(12, 0))
-
-with col2:
-    st.subheader("Solar Position")
-    solar_elevation = st.slider("Solar Elevation (°)", 11, 67, 40, step=1)
-    shadowed = st.slider("Shadowed Fraction", 0.0, 1.0, 0.0, step=0.05)
-
-hour_sin, hour_cos, day_sin, day_cos = compute_cyclic(input_time, input_date)
-
-st.sidebar.subheader("Operating & Weather Conditions")
-
-mass_flow = st.sidebar.slider("Mass Flow Rate (kg/s)", 0.10, 2.60, 1.76, step=0.01)
-T_inlet_c = st.sidebar.slider("Inlet Temperature (°C)", 0, 97, 63, step=1)
-T_inlet = celsius_to_kelvin(T_inlet_c)
-
-G_poa = st.sidebar.slider("Global POA Irradiance (W/m²)", 55, 1252, 613, step=10)
-beam_ratio = st.sidebar.slider("Beam Fraction", 0.0, 1.0, 0.66, step=0.01)
-G_poa_beam = G_poa * beam_ratio
-G_poa_diffuse = G_poa * (1 - beam_ratio)
-
-T_ambient_c = st.sidebar.slider("Ambient Temperature (°C)", -8, 35, 20, step=1)
-T_ambient = celsius_to_kelvin(T_ambient_c)
-
-wind_speed = st.sidebar.slider("Wind Speed (m/s)", 0.0, 3.5, 0.77, step=0.05)
-
-# ----------------------------- Build Input DataFrame -----------------------------
-input_data = {
-    "mass_flow": mass_flow,
-    "T_inlet": T_inlet,
-    "G_poa": G_poa,
-    "G_poa_beam": G_poa_beam,
-    "G_poa_diffuse": G_poa_diffuse,
-    "T_ambient": T_ambient,
-    "wind_speed": wind_speed,
-    "solar_elevation": solar_elevation,
-    "shadowed": shadowed,
-    "hour_sin": hour_sin,
-    "hour_cos": hour_cos,
-    "day_sin": day_sin,
-    "day_cos": day_cos,
-    "is_day": 1.0
+# ============================================================================
+# PHYSICAL CONSTRAINTS (from data statistics)
+# ============================================================================
+CONSTRAINTS = {
+    'mass_flow': {'min': 0.108727, 'max': 2.553023, 'default': 1.713578, 'unit': 'kg/s'},
+    'T_inlet': {'min': 273.575395, 'max': 370.207014, 'default': 338.320834, 'unit': 'K'},
+    'G_poa': {'min': 55.275, 'max': 1251.375, 'default': 617.466667, 'unit': 'W/m²'},
+    'G_poa_beam': {'min': 0.0, 'max': 966.322036, 'default': 430.652458, 'unit': 'W/m²'},
+    'G_poa_diffuse': {'min': 0.0, 'max': 669.648715, 'default': 186.087444, 'unit': 'W/m²'},
+    'T_ambient': {'min': 265.381667, 'max': 308.51875, 'default': 294.386375, 'unit': 'K'},
+    'wind_speed': {'min': 0.018333, 'max': 3.49, 'default': 0.719167, 'unit': 'm/s'},
+    'solar_elevation': {'min': 10.956602, 'max': 66.37248, 'default': 39.049221, 'unit': '°'},
+    'shadowed': {'min': 0.0, 'max': 1.0, 'default': 0.0, 'unit': 'binary'},
 }
 
-input_df = pd.DataFrame([input_data])
+# Physical constants
+C_P_WATER = 4186  # J/(kg·K) - specific heat capacity of water
 
-# ----------------------------- Prediction -----------------------------
-specific_power = predict_specific_power(input_df)[0]
-total_power_kw = specific_power * COLLECTOR_AREA / 1000
-efficiency = specific_power / G_poa if G_poa > 50 else 0.0
-day_active = is_daytime(solar_elevation, G_poa)
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+def kelvin_to_celsius(k):
+    """Convert Kelvin to Celsius"""
+    return k - 273.15
 
-# ----------------------------- Dashboard Display -----------------------------
-st.title("☀️ Solar Thermal Collector Performance Predictor")
-st.markdown("**Large-Scale Flat-Plate Collector Array** — 516 m² (Graz, Austria 2017) | Physics-based ML Prediction")
+def celsius_to_kelvin(c):
+    """Convert Celsius to Kelvin"""
+    return c + 273.15
 
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Specific Thermal Power", f"{specific_power:.1f} W/m²")
-with col2:
-    st.metric("Total Power Output", f"{total_power_kw:.1f} kW")
-with col3:
-    st.metric("Efficiency η", f"{efficiency:.1%}")
-with col4:
-    st.metric("System Status", "Active" if day_active else "Inactive")
+def validate_inputs(inputs):
+    """Validate physics-based constraints"""
+    warnings = []
+    
+    # Check if beam + diffuse <= total irradiance
+    if inputs['G_poa_beam'] + inputs['G_poa_diffuse'] > inputs['G_poa'] * 1.05:
+        warnings.append("⚠️ Beam + Diffuse irradiance exceeds total irradiance")
+    
+    # Check if inlet temperature is reasonable vs ambient
+    if inputs['T_inlet'] < inputs['T_ambient'] - 5:
+        warnings.append("⚠️ Inlet temperature is lower than ambient (unusual)")
+    
+    # Low irradiance check
+    if inputs['G_poa'] < 100:
+        warnings.append("ℹ️ Low irradiance - system may not be producing significant power")
+    
+    # Night time check
+    if inputs['solar_elevation'] < 15:
+        warnings.append("🌙 Low solar elevation - likely dawn/dusk or nighttime")
+    
+    # Low flow check
+    if inputs['mass_flow'] < 0.5:
+        warnings.append("⚠️ Very low mass flow rate - may indicate startup or shutdown")
+    
+    return warnings
 
-if not day_active:
-    st.info("🌙 Low sun or irradiance — minimal/no useful output expected.")
+def calculate_derived_metrics(inputs, prediction):
+    """Calculate physics-based derived metrics"""
+    metrics = {}
+    
+    # Thermal efficiency (η = Power / (Area × G_poa))
+    # Assuming 1 m² collector for specific power
+    if inputs['G_poa'] > 10:
+        metrics['efficiency'] = max(0, min(100, (prediction / inputs['G_poa']) * 100))
+    else:
+        metrics['efficiency'] = 0
+    
+    # Predicted temperature rise (ΔT = Power / (mass_flow × c_p))
+    if inputs['mass_flow'] > 0.01:
+        metrics['delta_T'] = prediction / (inputs['mass_flow'] * C_P_WATER)
+        metrics['T_outlet_pred'] = inputs['T_inlet'] + metrics['delta_T']
+    else:
+        metrics['delta_T'] = 0
+        metrics['T_outlet_pred'] = inputs['T_inlet']
+    
+    # Theoretical maximum power (if 100% efficient)
+    metrics['max_theoretical_power'] = inputs['G_poa']
+    
+    # Performance ratio
+    if metrics['max_theoretical_power'] > 0:
+        metrics['performance_ratio'] = (prediction / metrics['max_theoretical_power']) * 100
+    else:
+        metrics['performance_ratio'] = 0
+    
+    # Heat loss estimation (simplified)
+    delta_T_amb = inputs['T_inlet'] - inputs['T_ambient']
+    metrics['estimated_heat_loss'] = delta_T_amb * inputs['wind_speed'] * 5  # Simplified
+    
+    # Day/Night classification
+    metrics['is_operational'] = inputs['G_poa'] > 50 and inputs['mass_flow'] > 0.2
+    
+    return metrics
 
-# ----------------------------- Plots -----------------------------
-st.subheader("Performance Trends")
+def create_hourly_profile(base_inputs, hour_range=24):
+    """Generate predictions for a full day profile"""
+    hours = np.arange(0, hour_range)
+    predictions = []
+    efficiencies = []
+    
+    for hour in hours:
+        # Calculate hour angle features
+        hour_angle = 2 * np.pi * hour / 24
+        inputs_copy = base_inputs.copy()
+        inputs_copy['hour_sin'] = np.sin(hour_angle)
+        inputs_copy['hour_cos'] = np.cos(hour_angle)
+        
+        # Adjust solar elevation (simplified model)
+        inputs_copy['solar_elevation'] = max(0, 50 * np.sin(np.pi * (hour - 6) / 12))
+        
+        # Adjust irradiance based on solar elevation
+        if inputs_copy['solar_elevation'] > 0:
+            irr_factor = np.sin(np.radians(inputs_copy['solar_elevation']))
+            inputs_copy['G_poa'] = base_inputs['G_poa'] * irr_factor
+            inputs_copy['G_poa_beam'] = base_inputs['G_poa_beam'] * irr_factor
+            inputs_copy['G_poa_diffuse'] = base_inputs['G_poa_diffuse'] * irr_factor * 0.5
+            inputs_copy['is_day'] = 1.0
+        else:
+            inputs_copy['G_poa'] = 0
+            inputs_copy['G_poa_beam'] = 0
+            inputs_copy['G_poa_diffuse'] = 0
+            inputs_copy['is_day'] = 0.0
+        
+        # Make prediction
+        pred = make_prediction(inputs_copy)
+        predictions.append(max(0, pred))
+        
+        # Calculate efficiency
+        if inputs_copy['G_poa'] > 10:
+            eff = (pred / inputs_copy['G_poa']) * 100
+            efficiencies.append(max(0, min(100, eff)))
+        else:
+            efficiencies.append(0)
+    
+    return hours, predictions, efficiencies
 
-# Diurnal Profile
-hours = np.arange(0, 24, 0.5)
-diurnal_vals = []
-for h in hours:
-    h_sin = np.sin(2 * np.pi * h / 24)
-    h_cos = np.cos(2 * np.pi * h / 24)
-    elev = max(0, 66 * np.sin(np.pi * (h - 6)/12)) if 6 <= h <= 18 else 0
-    df_temp = input_df.copy()
-    df_temp["hour_sin"] = h_sin
-    df_temp["hour_cos"] = h_cos
-    df_temp["solar_elevation"] = elev
-    df_temp["is_day"] = 1 if elev > 10 else 0
-    p = predict_specific_power(df_temp)[0]
-    diurnal_vals.append(p)
+def make_prediction(inputs):
+    """Make prediction using the loaded model"""
+    try:
+        # Prepare feature vector in correct order
+        features = feature_config['features']
+        X = np.array([[inputs[f] for f in features]])
+        
+        # Scale and predict
+        X_scaled = scaler.transform(X)
+        prediction = model.predict(X_scaled)[0]
+        
+        # Physical constraints on prediction
+        prediction = max(-50, min(850, prediction))  # Based on data constraints
+        
+        return prediction
+    except Exception as e:
+        st.error(f"Prediction error: {e}")
+        return 0
 
-fig1 = go.Figure()
-fig1.add_trace(go.Scatter(x=hours, y=diurnal_vals, mode='lines', name='Power', line=dict(width=3, color='orange')))
-fig1.update_layout(title="Diurnal Power Profile", xaxis_title="Hour", yaxis_title="Specific Power (W/m²)", template="plotly_white")
-st.plotly_chart(fig1, use_container_width=True)
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+def main():
+    # Header
+    st.title("☀️ Solar Thermal Collector Performance Dashboard")
+    st.markdown("### Physics-Based Prediction System | No Data Leakage")
+    
+    # Sidebar for inputs
+    st.sidebar.header("⚙️ System Parameters")
+    
+    # Mode selection
+    mode = st.sidebar.radio(
+        "Operation Mode",
+        ["Single Point Prediction", "Daily Profile Analysis", "Sensitivity Analysis"],
+        help="Choose the analysis mode"
+    )
+    
+    st.sidebar.markdown("---")
+    
+    # ========================================================================
+    # INPUT SECTION
+    # ========================================================================
+    st.sidebar.subheader("📊 Operating Conditions")
+    
+    # Temperature inputs (show in Celsius, convert to Kelvin)
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        T_inlet_C = st.number_input(
+            "Inlet Temp (°C)",
+            min_value=kelvin_to_celsius(CONSTRAINTS['T_inlet']['min']),
+            max_value=kelvin_to_celsius(CONSTRAINTS['T_inlet']['max']),
+            value=kelvin_to_celsius(CONSTRAINTS['T_inlet']['default']),
+            step=1.0,
+            help="Fluid temperature entering the collector"
+        )
+    
+    with col2:
+        T_ambient_C = st.number_input(
+            "Ambient Temp (°C)",
+            min_value=kelvin_to_celsius(CONSTRAINTS['T_ambient']['min']),
+            max_value=kelvin_to_celsius(CONSTRAINTS['T_ambient']['max']),
+            value=kelvin_to_celsius(CONSTRAINTS['T_ambient']['default']),
+            step=1.0,
+            help="Outside air temperature"
+        )
+    
+    mass_flow = st.sidebar.slider(
+        "Mass Flow Rate (kg/s)",
+        min_value=float(CONSTRAINTS['mass_flow']['min']),
+        max_value=float(CONSTRAINTS['mass_flow']['max']),
+        value=float(CONSTRAINTS['mass_flow']['default']),
+        step=0.1,
+        help="Flow rate of heat transfer fluid"
+    )
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("☀️ Solar Conditions")
+    
+    G_poa = st.sidebar.slider(
+        "Total Irradiance (W/m²)",
+        min_value=float(CONSTRAINTS['G_poa']['min']),
+        max_value=float(CONSTRAINTS['G_poa']['max']),
+        value=float(CONSTRAINTS['G_poa']['default']),
+        step=10.0,
+        help="Total solar irradiance on collector plane"
+    )
+    
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        G_poa_beam = st.number_input(
+            "Beam (W/m²)",
+            min_value=float(CONSTRAINTS['G_poa_beam']['min']),
+            max_value=min(float(CONSTRAINTS['G_poa_beam']['max']), G_poa),
+            value=min(float(CONSTRAINTS['G_poa_beam']['default']), G_poa * 0.7),
+            step=10.0,
+            help="Direct beam irradiance"
+        )
+    
+    with col2:
+        G_poa_diffuse = st.number_input(
+            "Diffuse (W/m²)",
+            min_value=float(CONSTRAINTS['G_poa_diffuse']['min']),
+            max_value=min(float(CONSTRAINTS['G_poa_diffuse']['max']), G_poa),
+            value=min(float(CONSTRAINTS['G_poa_diffuse']['default']), G_poa * 0.3),
+            step=10.0,
+            help="Diffuse sky irradiance"
+        )
+    
+    solar_elevation = st.sidebar.slider(
+        "Solar Elevation (°)",
+        min_value=float(CONSTRAINTS['solar_elevation']['min']),
+        max_value=float(CONSTRAINTS['solar_elevation']['max']),
+        value=float(CONSTRAINTS['solar_elevation']['default']),
+        step=1.0,
+        help="Sun angle above horizon"
+    )
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🌬️ Environmental Conditions")
+    
+    wind_speed = st.sidebar.slider(
+        "Wind Speed (m/s)",
+        min_value=float(CONSTRAINTS['wind_speed']['min']),
+        max_value=float(CONSTRAINTS['wind_speed']['max']),
+        value=float(CONSTRAINTS['wind_speed']['default']),
+        step=0.1,
+        help="Wind speed affects convective heat loss"
+    )
+    
+    shadowed = st.sidebar.checkbox(
+        "Collector Shadowed",
+        value=False,
+        help="Check if collector is partially or fully shadowed"
+    )
+    
+    # Advanced options
+    with st.sidebar.expander("🔧 Advanced Options"):
+        hour_of_day = st.slider("Hour of Day", 0, 23, 12, help="For temporal features")
+        day_of_year = st.slider("Day of Year", 1, 365, 180, help="For seasonal features")
+    
+    # Calculate temporal features
+    hour_angle = 2 * np.pi * hour_of_day / 24
+    day_angle = 2 * np.pi * day_of_year / 365
+    
+    # Prepare inputs dictionary
+    inputs = {
+        'mass_flow': mass_flow,
+        'T_inlet': celsius_to_kelvin(T_inlet_C),
+        'G_poa': G_poa,
+        'G_poa_beam': G_poa_beam,
+        'G_poa_diffuse': G_poa_diffuse,
+        'T_ambient': celsius_to_kelvin(T_ambient_C),
+        'wind_speed': wind_speed,
+        'solar_elevation': solar_elevation,
+        'shadowed': 1.0 if shadowed else 0.0,
+        'hour_sin': np.sin(hour_angle),
+        'hour_cos': np.cos(hour_angle),
+        'day_sin': np.sin(day_angle),
+        'day_cos': np.cos(day_angle),
+        'is_day': 1.0 if solar_elevation > 15 else 0.0
+    }
+    
+    # ========================================================================
+    # VALIDATION
+    # ========================================================================
+    validation_warnings = validate_inputs(inputs)
+    if validation_warnings:
+        with st.expander("⚠️ Input Validation Warnings", expanded=True):
+            for warning in validation_warnings:
+                st.warning(warning)
+    
+    # ========================================================================
+    # PREDICTION
+    # ========================================================================
+    if mode == "Single Point Prediction":
+        st.header("📈 Single Point Prediction")
+        
+        # Make prediction
+        prediction = make_prediction(inputs)
+        derived_metrics = calculate_derived_metrics(inputs, prediction)
+        
+        # Display main results
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                "Predicted Power",
+                f"{prediction:.2f} W/m²",
+                help="Specific thermal power output"
+            )
+        
+        with col2:
+            st.metric(
+                "Thermal Efficiency",
+                f"{derived_metrics['efficiency']:.1f}%",
+                help="η = Power / Irradiance"
+            )
+        
+        with col3:
+            st.metric(
+                "Temperature Rise",
+                f"{derived_metrics['delta_T']:.2f} K",
+                help="ΔT = Power / (ṁ × cp)"
+            )
+        
+        with col4:
+            status = "🟢 Operational" if derived_metrics['is_operational'] else "🔴 Inactive"
+            st.metric(
+                "System Status",
+                status,
+                help="Based on irradiance and flow rate"
+            )
+        
+        # Additional metrics
+        st.markdown("---")
+        st.subheader("🔬 Detailed Physics Analysis")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Predicted Outlet Temp", 
+                     f"{kelvin_to_celsius(derived_metrics['T_outlet_pred']):.1f} °C")
+            st.metric("Inlet Temperature", 
+                     f"{T_inlet_C:.1f} °C")
+            st.metric("Ambient Temperature", 
+                     f"{T_ambient_C:.1f} °C")
+        
+        with col2:
+            st.metric("Total Irradiance", f"{G_poa:.1f} W/m²")
+            st.metric("Beam Component", f"{G_poa_beam:.1f} W/m²")
+            st.metric("Diffuse Component", f"{G_poa_diffuse:.1f} W/m²")
+        
+        with col3:
+            st.metric("Performance Ratio", 
+                     f"{derived_metrics['performance_ratio']:.1f}%")
+            st.metric("Max Theoretical Power", 
+                     f"{derived_metrics['max_theoretical_power']:.1f} W/m²")
+            st.metric("Est. Heat Loss", 
+                     f"{derived_metrics['estimated_heat_loss']:.1f} W/m²")
+        
+        # Visualization
+        st.markdown("---")
+        st.subheader("📊 Energy Balance Breakdown")
+        
+        # Create energy balance chart
+        fig = go.Figure()
+        
+        categories = ['Solar Input', 'Useful Heat', 'Losses', 'Efficiency']
+        values = [
+            G_poa,
+            prediction,
+            G_poa - prediction if G_poa > prediction else 0,
+            derived_metrics['efficiency']
+        ]
+        colors = ['#FDB462', '#80B1D3', '#FB8072', '#B3DE69']
+        
+        fig.add_trace(go.Bar(
+            x=categories[:3],
+            y=values[:3],
+            marker_color=colors[:3],
+            text=[f"{v:.1f}" for v in values[:3]],
+            textposition='auto',
+        ))
+        
+        fig.update_layout(
+            title="Energy Flow Analysis",
+            yaxis_title="Power (W/m²)",
+            showlegend=False,
+            height=400
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Feature importance visualization
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Irradiance components pie chart
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=['Beam', 'Diffuse'],
+                values=[G_poa_beam, G_poa_diffuse],
+                hole=0.3,
+                marker_colors=['#FFD700', '#87CEEB']
+            )])
+            fig_pie.update_layout(title="Irradiance Composition", height=300)
+            st.plotly_chart(fig_pie, use_container_width=True)
+        
+        with col2:
+            # Temperature profile
+            temps = {
+                'Ambient': T_ambient_C,
+                'Inlet': T_inlet_C,
+                'Predicted Outlet': kelvin_to_celsius(derived_metrics['T_outlet_pred'])
+            }
+            fig_temp = go.Figure(data=[go.Bar(
+                x=list(temps.keys()),
+                y=list(temps.values()),
+                marker_color=['#1f77b4', '#ff7f0e', '#2ca02c']
+            )])
+            fig_temp.update_layout(
+                title="Temperature Profile",
+                yaxis_title="Temperature (°C)",
+                height=300
+            )
+            st.plotly_chart(fig_temp, use_container_width=True)
+    
+    # ========================================================================
+    # DAILY PROFILE MODE
+    # ========================================================================
+    elif mode == "Daily Profile Analysis":
+        st.header("🌅 Daily Performance Profile")
+        
+        st.info("Simulating collector performance over 24 hours with current conditions")
+        
+        # Generate daily profile
+        hours, predictions, efficiencies = create_hourly_profile(inputs)
+        
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=('Thermal Power Output', 'Thermal Efficiency'),
+            vertical_spacing=0.15
+        )
+        
+        # Power plot
+        fig.add_trace(
+            go.Scatter(x=hours, y=predictions, mode='lines+markers',
+                      name='Power', line=dict(color='#1f77b4', width=3),
+                      fill='tozeroy'),
+            row=1, col=1
+        )
+        
+        # Efficiency plot
+        fig.add_trace(
+            go.Scatter(x=hours, y=efficiencies, mode='lines+markers',
+                      name='Efficiency', line=dict(color='#2ca02c', width=3),
+                      fill='tozeroy'),
+            row=2, col=1
+        )
+        
+        fig.update_xaxes(title_text="Hour of Day", row=2, col=1)
+        fig.update_yaxes(title_text="Power (W/m²)", row=1, col=1)
+        fig.update_yaxes(title_text="Efficiency (%)", row=2, col=1)
+        
+        fig.update_layout(height=700, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Daily statistics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Peak Power", f"{max(predictions):.1f} W/m²")
+        with col2:
+            st.metric("Average Power", f"{np.mean(predictions):.1f} W/m²")
+        with col3:
+            st.metric("Daily Energy", f"{np.trapz(predictions) / 1000:.2f} kWh/m²")
+        with col4:
+            st.metric("Avg Efficiency", f"{np.mean(efficiencies):.1f}%")
+        
+        # Download option
+        df_profile = pd.DataFrame({
+            'Hour': hours,
+            'Power (W/m²)': predictions,
+            'Efficiency (%)': efficiencies
+        })
+        
+        csv = df_profile.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Daily Profile",
+            data=csv,
+            file_name="daily_profile.csv",
+            mime="text/csv"
+        )
+    
+    # ========================================================================
+    # SENSITIVITY ANALYSIS MODE
+    # ========================================================================
+    elif mode == "Sensitivity Analysis":
+        st.header("🔍 Sensitivity Analysis")
+        
+        param_choice = st.selectbox(
+            "Select Parameter to Vary",
+            ["G_poa", "mass_flow", "T_inlet", "wind_speed", "solar_elevation"]
+        )
+        
+        # Get parameter range
+        param_min = CONSTRAINTS[param_choice]['min']
+        param_max = CONSTRAINTS[param_choice]['max']
+        param_values = np.linspace(param_min, param_max, 50)
+        
+        predictions = []
+        efficiencies = []
+        
+        # Calculate predictions for each value
+        progress_bar = st.progress(0)
+        for i, val in enumerate(param_values):
+            inputs_copy = inputs.copy()
+            inputs_copy[param_choice] = val
+            
+            pred = make_prediction(inputs_copy)
+            predictions.append(max(0, pred))
+            
+            if inputs_copy['G_poa'] > 10:
+                eff = (pred / inputs_copy['G_poa']) * 100
+                efficiencies.append(max(0, min(100, eff)))
+            else:
+                efficiencies.append(0)
+            
+            progress_bar.progress((i + 1) / len(param_values))
+        
+        progress_bar.empty()
+        
+        # Convert temperature to Celsius for display if needed
+        if param_choice in ['T_inlet', 'T_ambient']:
+            param_values_display = [kelvin_to_celsius(v) for v in param_values]
+            x_label = f"{param_choice} (°C)"
+        else:
+            param_values_display = param_values
+            x_label = f"{param_choice} ({CONSTRAINTS[param_choice]['unit']})"
+        
+        # Create plots
+        fig = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=('Power vs Parameter', 'Efficiency vs Parameter')
+        )
+        
+        fig.add_trace(
+            go.Scatter(x=param_values_display, y=predictions, mode='lines',
+                      line=dict(color='#1f77b4', width=3)),
+            row=1, col=1
+        )
+        
+        fig.add_trace(
+            go.Scatter(x=param_values_display, y=efficiencies, mode='lines',
+                      line=dict(color='#2ca02c', width=3)),
+            row=1, col=2
+        )
+        
+        fig.update_xaxes(title_text=x_label, row=1, col=1)
+        fig.update_xaxes(title_text=x_label, row=1, col=2)
+        fig.update_yaxes(title_text="Power (W/m²)", row=1, col=1)
+        fig.update_yaxes(title_text="Efficiency (%)", row=1, col=2)
+        
+        fig.update_layout(height=500, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Statistics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Max Power", f"{max(predictions):.1f} W/m²")
+        with col2:
+            st.metric("Min Power", f"{min(predictions):.1f} W/m²")
+        with col3:
+            sensitivity = (max(predictions) - min(predictions)) / (param_max - param_min)
+            st.metric("Sensitivity", f"{sensitivity:.2f} W/m² per unit")
+    
+    # ========================================================================
+    # FOOTER
+    # ========================================================================
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align: center; color: #666;'>
+        <p>🔬 Physics-Based Solar Thermal Collector Model | No Data Leakage</p>
+        <p>Model: LightGBM | Features: 14 | Target: Specific Thermal Power (W/m²)</p>
+    </div>
+    """, unsafe_allow_html=True)
 
-# Efficiency Curve
-gpoa_range = np.linspace(55, 1250, 80)
-effs = []
-for g in gpoa_range:
-    df_temp = input_df.copy()
-    df_temp["G_poa"] = g
-    df_temp["G_poa_beam"] = g * beam_ratio
-    df_temp["G_poa_diffuse"] = g * (1 - beam_ratio)
-    p = predict_specific_power(df_temp)[0]
-    effs.append(p / g if g > 50 else 0)
-
-fig2 = go.Figure()
-fig2.add_trace(go.Scatter(x=gpoa_range, y=effs, mode='lines', name='Efficiency', line=dict(width=3, color='green')))
-fig2.update_layout(title="Efficiency vs Irradiance", xaxis_title="G_poa (W/m²)", yaxis_title="Efficiency", yaxis_tickformat=".1%", template="plotly_white")
-st.plotly_chart(fig2, use_container_width=True)
-
-# ----------------------------- Footer -----------------------------
-st.markdown("---")
-st.caption("""
-**Model**: LightGBM (no data leakage) | Trained on high-precision 2017 operational data  
-**Test Performance**: R² = 0.851 | MAE = 34.3 W/m²  
-**Note**: Predictions are constrained to physically realistic ranges based on real system behavior.
-""")
+# ============================================================================
+# RUN APPLICATION
+# ============================================================================
+if __name__ == "__main__":
+    main()
