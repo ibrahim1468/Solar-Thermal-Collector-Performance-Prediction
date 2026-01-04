@@ -3,7 +3,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import datetime, time
 
 # ----------------------------- Page Config -----------------------------
@@ -14,38 +13,64 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ----------------------------- Load Model & Artifacts -----------------------------
+# ----------------------------- Load Model & Artifacts (FIXED) -----------------------------
 @st.cache_resource
 def load_artifacts():
-    model = joblib.load("best_model_lightgbm_noleak.joblib")
-    scaler = joblib.load("scaler_noleak.joblib")
-    feature_config = joblib.load("feature_config_noleak.joblib")  # list of feature names
-    return model, scaler, feature_config
+    try:
+        model = joblib.load("best_model_lightgbm_noleak.joblib")
+        scaler = joblib.load("scaler_noleak.joblib")
+        config = joblib.load("feature_config_noleak.joblib")
+        
+        # --- CRITICAL FIX: Robustly extract feature names as list ---
+        if isinstance(config, list):
+            feature_names = config
+        elif isinstance(config, dict):
+            # Try common keys
+            if 'feature_names' in config:
+                feature_names = config['feature_names']
+            elif 'features' in config:
+                feature_names = config['features']
+            else:
+                feature_names = list(config.keys())
+        elif hasattr(config, '__dict__'):
+            feature_names = list(config.__dict__.keys())
+        else:
+            # Fallback: assume it's model-related and extract from model if possible
+            if hasattr(model, 'feature_name_'):
+                feature_names = model.feature_name_()
+            elif hasattr(model, 'feature_names'):
+                feature_names = model.feature_names
+            else:
+                raise ValueError("Could not extract feature names from config or model.")
+        
+        # Final cleanup: ensure list of strings
+        feature_names = [str(name).strip() for name in feature_names]
+        
+        st.success(f"Model and artifacts loaded successfully! Using {len(feature_names)} features.")
+        return model, scaler, feature_names
+    
+    except Exception as e:
+        st.error(f"Failed to load model artifacts: {str(e)}")
+        st.stop()
 
 model, scaler, feature_names = load_artifacts()
 
-# Collector area (gross) - from the Graz dataset
-COLLECTOR_AREA = 516  # m²
+# Hardcoded fallback (safety net) - replace with your actual 14 features if needed
+EXPECTED_FEATURES = [
+    "mass_flow", "T_inlet", "G_poa", "G_poa_beam", "G_poa_diffuse",
+    "T_ambient", "wind_speed", "solar_elevation", "shadowed",
+    "hour_sin", "hour_cos", "day_sin", "day_cos", "is_day"
+]
 
-# ----------------------------- Realistic Limits (from data stats) -----------------------------
-limits = {
-    "mass_flow": (0.10, 2.60),       # kg/s (slightly buffered)
-    "T_inlet": (273, 371),           # K
-    "G_poa": (55, 1252),             # W/m²
-    "G_poa_beam": (0, 967),          # W/m²
-    "G_poa_diffuse": (0, 670),       # W/m²
-    "T_ambient": (265, 309),         # K
-    "wind_speed": (0.00, 3.50),      # m/s
-    "solar_elevation": (11, 67),     # degrees
-    "shadowed": (0, 1),              # fraction
-}
+if len(feature_names) != len(EXPECTED_FEATURES):
+    st.warning(f"Feature count mismatch. Expected {len(EXPECTED_FEATURES)}, got {len(feature_names)}. Using loaded ones.")
+
+# ----------------------------- Collector Area -----------------------------
+COLLECTOR_AREA = 516  # m² (gross)
 
 # ----------------------------- Helper Functions -----------------------------
 def celsius_to_kelvin(c):
     return c + 273.15
-
-def kelvin_to_celsius(k):
-    return k - 273.15
 
 def compute_cyclic(time_obj, date_obj):
     hour = time_obj.hour + time_obj.minute / 60.0
@@ -60,11 +85,17 @@ def is_daytime(elevation, gpoa):
     return (elevation > 10) and (gpoa > 50)
 
 def predict_specific_power(input_df):
-    scaled = scaler.transform(input_df[feature_names])
-    pred = model.predict(scaled)
-    return np.clip(pred, -60, 850)  # physical clipping (small negative allowed for losses)
+    try:
+        # Ensure exact column order and selection
+        input_ordered = input_df[feature_names]
+        scaled = scaler.transform(input_ordered)
+        pred = model.predict(scaled)
+        return np.clip(pred, -60, 850)
+    except Exception as e:
+        st.error(f"Prediction failed: {str(e)}")
+        return np.array([0.0])
 
-# ----------------------------- Sidebar - User Inputs -----------------------------
+# ----------------------------- Sidebar Inputs -----------------------------
 st.sidebar.header("☀️ Input Parameters")
 
 col1, col2 = st.sidebar.columns(2)
@@ -75,51 +106,29 @@ with col1:
     input_time = st.time_input("Time", value=time(12, 0))
 
 with col2:
-    st.subheader("Location-Derived")
-    solar_elevation = st.slider("Solar Elevation (°)", 
-                                min_value=11, max_value=67, value=40, step=1,
-                                help="Angle of sun above horizon")
-    shadowed = st.slider("Shadowed Fraction", 
-                         min_value=0.0, max_value=1.0, value=0.0, step=0.05,
-                         help="0 = no shadow, 1 = fully shadowed")
+    st.subheader("Solar Position")
+    solar_elevation = st.slider("Solar Elevation (°)", 11, 67, 40, step=1)
+    shadowed = st.slider("Shadowed Fraction", 0.0, 1.0, 0.0, step=0.05)
 
-# Automatic cyclic features
 hour_sin, hour_cos, day_sin, day_cos = compute_cyclic(input_time, input_date)
 
 st.sidebar.subheader("Operating & Weather Conditions")
 
-mass_flow = st.sidebar.slider("Mass Flow Rate (kg/s)", 
-                              min_value=0.10, max_value=2.60, value=1.76, step=0.01)
-
-T_inlet_c = st.sidebar.slider("Inlet Temperature (°C)", 
-                              min_value=0, max_value=97, value=63, step=1)
+mass_flow = st.sidebar.slider("Mass Flow Rate (kg/s)", 0.10, 2.60, 1.76, step=0.01)
+T_inlet_c = st.sidebar.slider("Inlet Temperature (°C)", 0, 97, 63, step=1)
 T_inlet = celsius_to_kelvin(T_inlet_c)
 
-G_poa = st.sidebar.slider("Global POA Irradiance (W/m²)", 
-                          min_value=55, max_value=1252, value=613, step=10)
-
-# Beam / Diffuse split (user can adjust ratio)
-beam_ratio = st.sidebar.slider("Beam Fraction of G_poa", 
-                               min_value=0.0, max_value=1.0, value=0.66, step=0.01,
-                               help="0 = fully diffuse, 1 = fully direct")
+G_poa = st.sidebar.slider("Global POA Irradiance (W/m²)", 55, 1252, 613, step=10)
+beam_ratio = st.sidebar.slider("Beam Fraction", 0.0, 1.0, 0.66, step=0.01)
 G_poa_beam = G_poa * beam_ratio
 G_poa_diffuse = G_poa * (1 - beam_ratio)
 
-T_ambient_c = st.sidebar.slider("Ambient Temperature (°C)", 
-                                min_value=-8, max_value=35, value=20, step=1)
+T_ambient_c = st.sidebar.slider("Ambient Temperature (°C)", -8, 35, 20, step=1)
 T_ambient = celsius_to_kelvin(T_ambient_c)
 
-wind_speed = st.sidebar.slider("Wind Speed (m/s)", 
-                               min_value=0.0, max_value=3.5, value=0.77, step=0.05)
+wind_speed = st.sidebar.slider("Wind Speed (m/s)", 0.0, 3.5, 0.77, step=0.05)
 
-# ----------------------------- Main Dashboard -----------------------------
-st.title("☀️ Solar Thermal Collector Performance Predictor")
-st.markdown("""
-**Large-Scale Flat-Plate Collector Array** (516 m² gross area, Graz 2017 dataset)  
-Physics-based ML model (LightGBM) — predicts performance **without** using outlet temperature.
-""")
-
-# Prepare input dataframe
+# ----------------------------- Build Input DataFrame -----------------------------
 input_data = {
     "mass_flow": mass_flow,
     "T_inlet": T_inlet,
@@ -139,86 +148,72 @@ input_data = {
 
 input_df = pd.DataFrame([input_data])
 
-# Prediction
+# ----------------------------- Prediction -----------------------------
 specific_power = predict_specific_power(input_df)[0]
-total_power = specific_power * COLLECTOR_AREA / 1000  # kW
+total_power_kw = specific_power * COLLECTOR_AREA / 1000
 efficiency = specific_power / G_poa if G_poa > 50 else 0.0
-
-# Day/night flag
 day_active = is_daytime(solar_elevation, G_poa)
 
-# ----------------------------- Metrics Display -----------------------------
-col1, col2, col3, col4 = st.columns(4)
+# ----------------------------- Dashboard Display -----------------------------
+st.title("☀️ Solar Thermal Collector Performance Predictor")
+st.markdown("**Large-Scale Flat-Plate Collector Array** — 516 m² (Graz, Austria 2017) | Physics-based ML Prediction")
 
+col1, col2, col3, col4 = st.columns(4)
 with col1:
-    st.metric("Specific Thermal Power", f"{specific_power:.1f} W/m²",
-              delta=None if day_active else "Low irradiance/flow")
+    st.metric("Specific Thermal Power", f"{specific_power:.1f} W/m²")
 with col2:
-    st.metric("Total Thermal Power", f"{total_power:.1f} kW")
+    st.metric("Total Power Output", f"{total_power_kw:.1f} kW")
 with col3:
-    st.metric("Instantaneous Efficiency", f"{efficiency*100:.1f}%")
+    st.metric("Efficiency η", f"{efficiency:.1%}")
 with col4:
-    status = "Active" if day_active else "Inactive (night/low sun)"
-    st.metric("System Status", status)
+    st.metric("System Status", "Active" if day_active else "Inactive")
 
 if not day_active:
-    st.warning("⚠️ Low solar elevation or irradiance — collector likely inactive. "
-               "Power output will be near zero or negative (losses).")
+    st.info("🌙 Low sun or irradiance — minimal/no useful output expected.")
 
-# ----------------------------- Interactive Plots -----------------------------
-st.subheader("Predicted Performance Trends")
+# ----------------------------- Plots -----------------------------
+st.subheader("Performance Trends")
 
-# 1. Diurnal trend (vary hour, fixed date)
+# Diurnal Profile
 hours = np.arange(0, 24, 0.5)
-diurnal_power = []
+diurnal_vals = []
 for h in hours:
     h_sin = np.sin(2 * np.pi * h / 24)
     h_cos = np.cos(2 * np.pi * h / 24)
-    temp_df = input_df.copy()
-    temp_df["hour_sin"] = h_sin
-    temp_df["hour_cos"] = h_cos
-    # Approximate elevation change (simple sinusoidal model for demo)
-    max_elev = 66  # summer max
-    elev = max(0, max_elev * np.sin(np.pi * (h - 6) / 12)) if 6 <= h <= 18 else 0
-    temp_df["solar_elevation"] = elev
-    temp_df["is_day"] = 1 if elev > 10 else 0
-    p = predict_specific_power(temp_df)[0]
-    diurnal_power.append(p)
+    elev = max(0, 66 * np.sin(np.pi * (h - 6)/12)) if 6 <= h <= 18 else 0
+    df_temp = input_df.copy()
+    df_temp["hour_sin"] = h_sin
+    df_temp["hour_cos"] = h_cos
+    df_temp["solar_elevation"] = elev
+    df_temp["is_day"] = 1 if elev > 10 else 0
+    p = predict_specific_power(df_temp)[0]
+    diurnal_vals.append(p)
 
 fig1 = go.Figure()
-fig1.add_trace(go.Scatter(x=hours, y=diurnal_power, mode='lines', name='Specific Power',
-                          line=dict(width=3)))
-fig1.update_layout(title="Diurnal Power Profile (Fixed Date & Weather)",
-                   xaxis_title="Hour of Day", yaxis_title="Specific Thermal Power (W/m²)",
-                   template="plotly_white")
+fig1.add_trace(go.Scatter(x=hours, y=diurnal_vals, mode='lines', name='Power', line=dict(width=3, color='orange')))
+fig1.update_layout(title="Diurnal Power Profile", xaxis_title="Hour", yaxis_title="Specific Power (W/m²)", template="plotly_white")
 st.plotly_chart(fig1, use_container_width=True)
 
-# 2. Efficiency vs Irradiance (vary G_poa)
-gpoa_range = np.linspace(55, 1250, 100)
-eff_vs_g = []
+# Efficiency Curve
+gpoa_range = np.linspace(55, 1250, 80)
+effs = []
 for g in gpoa_range:
-    temp_df = input_df.copy()
-    temp_df["G_poa"] = g
-    temp_df["G_poa_beam"] = g * beam_ratio
-    temp_df["G_poa_diffuse"] = g * (1 - beam_ratio)
-    p = predict_specific_power(temp_df)[0]
-    eff = p / g if g > 50 else 0
-    eff_vs_g.append(eff)
+    df_temp = input_df.copy()
+    df_temp["G_poa"] = g
+    df_temp["G_poa_beam"] = g * beam_ratio
+    df_temp["G_poa_diffuse"] = g * (1 - beam_ratio)
+    p = predict_specific_power(df_temp)[0]
+    effs.append(p / g if g > 50 else 0)
 
 fig2 = go.Figure()
-fig2.add_trace(go.Scatter(x=gpoa_range, y=eff_vs_g, mode='lines', name='Efficiency',
-                          line=dict(color='orange', width=3)))
-fig2.update_layout(title="Collector Efficiency vs Irradiance",
-                   xaxis_title="G_poa (W/m²)", yaxis_title="Efficiency η",
-                   yaxis=dict(tickformat=".1%"), template="plotly_white")
+fig2.add_trace(go.Scatter(x=gpoa_range, y=effs, mode='lines', name='Efficiency', line=dict(width=3, color='green')))
+fig2.update_layout(title="Efficiency vs Irradiance", xaxis_title="G_poa (W/m²)", yaxis_title="Efficiency", yaxis_tickformat=".1%", template="plotly_white")
 st.plotly_chart(fig2, use_container_width=True)
 
 # ----------------------------- Footer -----------------------------
 st.markdown("---")
-st.markdown("""
-**Model Details**  
-• Trained on 2017 high-precision data from a 516 m² flat-plate collector array in Graz, Austria  
-• LightGBM regressor (no data leakage — outlet temperature excluded)  
-• Test R²: 0.851 | MAE: 34.3 W/m²  
-• All predictions are physics-constrained and validated against real operational limits.
+st.caption("""
+**Model**: LightGBM (no data leakage) | Trained on high-precision 2017 operational data  
+**Test Performance**: R² = 0.851 | MAE = 34.3 W/m²  
+**Note**: Predictions are constrained to physically realistic ranges based on real system behavior.
 """)
