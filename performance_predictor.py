@@ -161,30 +161,70 @@ def calculate_derived_metrics(inputs, prediction):
     
     return metrics
 
-def create_hourly_profile(base_inputs, hour_range=24):
+def create_hourly_profile(base_inputs, hour_range=24, day_of_year=None):
     """Generate predictions for a full day profile"""
     hours = np.arange(0, hour_range)
     predictions = []
     efficiencies = []
+    irradiances = []
+    solar_elevations = []
+    
+    # Use provided day_of_year or extract from base_inputs
+    if day_of_year is None:
+        # Back-calculate day from sin/cos if needed
+        day_of_year = 180  # Default to summer solstice
+    
+    # Calculate day angle features (constant for the whole day)
+    day_angle = 2 * np.pi * day_of_year / 365
+    day_sin = np.sin(day_angle)
+    day_cos = np.cos(day_angle)
     
     for hour in hours:
-        # Calculate hour angle features
+        # Calculate hour angle features from actual hour
         hour_angle = 2 * np.pi * hour / 24
-        inputs_copy = base_inputs.copy()
-        inputs_copy['hour_sin'] = np.sin(hour_angle)
-        inputs_copy['hour_cos'] = np.cos(hour_angle)
+        hour_sin = np.sin(hour_angle)
+        hour_cos = np.cos(hour_angle)
         
-        # Adjust solar elevation (simplified model)
-        inputs_copy['solar_elevation'] = max(0, 50 * np.sin(np.pi * (hour - 6) / 12))
+        inputs_copy = base_inputs.copy()
+        
+        # Set temporal features
+        inputs_copy['hour_sin'] = hour_sin
+        inputs_copy['hour_cos'] = hour_cos
+        inputs_copy['day_sin'] = day_sin
+        inputs_copy['day_cos'] = day_cos
+        
+        # Adjust solar elevation (simplified solar position model)
+        # Peak at solar noon (hour 12), accounting for day of year
+        declination = 23.45 * np.sin(2 * np.pi * (284 + day_of_year) / 365)
+        hour_angle_deg = 15 * (hour - 12)  # 15° per hour from solar noon
+        
+        # Simplified solar elevation calculation
+        latitude = 35  # Assumed latitude (adjust as needed)
+        elevation = np.arcsin(
+            np.sin(np.radians(latitude)) * np.sin(np.radians(declination)) +
+            np.cos(np.radians(latitude)) * np.cos(np.radians(declination)) * 
+            np.cos(np.radians(hour_angle_deg))
+        )
+        elevation_deg = max(0, np.degrees(elevation))
+        
+        inputs_copy['solar_elevation'] = elevation_deg
         
         # Adjust irradiance based on solar elevation
-        if inputs_copy['solar_elevation'] > 0:
-            irr_factor = np.sin(np.radians(inputs_copy['solar_elevation']))
+        if elevation_deg > 5:  # Sun is above horizon
+            # Air mass calculation
+            air_mass = 1 / (np.sin(np.radians(elevation_deg)) + 0.50572 * (elevation_deg + 6.07995)**(-1.6364))
+            air_mass = min(air_mass, 10)  # Cap air mass
+            
+            # Atmospheric attenuation
+            irr_factor = 0.7**(air_mass**0.678)
+            
+            # Scale base irradiance
             inputs_copy['G_poa'] = base_inputs['G_poa'] * irr_factor
             inputs_copy['G_poa_beam'] = base_inputs['G_poa_beam'] * irr_factor
-            inputs_copy['G_poa_diffuse'] = base_inputs['G_poa_diffuse'] * irr_factor * 0.5
+            inputs_copy['G_poa_diffuse'] = base_inputs['G_poa_diffuse'] * irr_factor * 0.8
             inputs_copy['is_day'] = 1.0
         else:
+            # Nighttime
             inputs_copy['G_poa'] = 0
             inputs_copy['G_poa_beam'] = 0
             inputs_copy['G_poa_diffuse'] = 0
@@ -193,6 +233,8 @@ def create_hourly_profile(base_inputs, hour_range=24):
         # Make prediction
         pred = make_prediction(inputs_copy)
         predictions.append(max(0, pred))
+        irradiances.append(inputs_copy['G_poa'])
+        solar_elevations.append(elevation_deg)
         
         # Calculate efficiency
         if inputs_copy['G_poa'] > 10:
@@ -201,7 +243,7 @@ def create_hourly_profile(base_inputs, hour_range=24):
         else:
             efficiencies.append(0)
     
-    return hours, predictions, efficiencies
+    return hours, predictions, efficiencies, irradiances, solar_elevations
 
 def make_prediction(inputs):
     """Make prediction using the loaded model"""
